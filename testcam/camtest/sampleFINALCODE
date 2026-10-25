@@ -1,0 +1,252 @@
+#include "esp_camera.h"
+#include "img_converters.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+
+// ---------- WiFi ----------
+const char* ssid     = "TAMU_IoT";   // or your phone hotspot
+const char* password = "";           // empty for TAMU_IoT
+
+// ---------- Pins ----------
+const int TRIG_PIN  = 1;
+const int ECHO_PIN  = 2;    // through the 1k/2k divider
+const int SERVO_PIN = 21;
+
+// ---------- Tracking settings ----------
+const int ANGLE_MIN = 20;
+const int ANGLE_MAX = 160;
+const int STEP = 2;                          // degrees per tick
+const int REACQ_SPAN = 25;                   // search window when lost
+const unsigned long TICK_MS = 80;            // time between distance readings
+const unsigned long REACQ_TIMEOUT_MS = 4000;
+
+int minCm = 20;
+int maxCm = 100;
+
+enum State { SEARCH, CENTER, LOCKED, REACQUIRE };
+const char* STATE_NAMES[] = {"SEARCH", "CENTER", "LOCKED", "REACQUIRE"};
+State state = SEARCH;
+
+int angle = 90, dir = 1;
+int lo = ANGLE_MIN, hi = ANGLE_MAX;
+int startAngle = 90;
+int misses = 0;
+float dist = -1;
+bool inRange = false;
+unsigned long lastTick = 0, reacqStart = 0;
+
+Servo panServo;
+WebServer server(80);
+
+// ---------- Web page ----------
+const char PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{font-family:Helvetica;text-align:center}img{width:100%;max-width:640px}</style>
+</head><body>
+<h2>Object tracker</h2>
+<img id="cam" src="/jpg">
+<p id="st">connecting...</p>
+<p>Range (cm): <input id="mn" type="number" value="20" style="width:60px"> to
+<input id="mx" type="number" value="100" style="width:60px">
+<button onclick="setR()">Set</button></p>
+<script>
+const img = document.getElementById('cam');
+img.onload  = () => setTimeout(() => { img.src = '/jpg?t=' + Date.now(); }, 50);
+img.onerror = () => setTimeout(() => { img.src = '/jpg?t=' + Date.now(); }, 1000);
+async function poll() {
+  try {
+    const r = await fetch('/status');
+    const s = await r.json();
+    const d = s.dist < 0 ? 'no echo' : s.dist + ' cm';
+    document.getElementById('st').textContent =
+      s.state + ' | angle ' + s.angle + ' deg | distance ' + d + ' | ' + (s.inRange ? 'IN RANGE' : 'out of range');
+  } catch (e) {}
+  setTimeout(poll, 500);
+}
+poll();
+function setR() {
+  fetch('/set?min=' + document.getElementById('mn').value + '&max=' + document.getElementById('mx').value);
+}
+</script>
+</body></html>
+)rawliteral";
+
+// ---------- Web handlers ----------
+void handleRoot() { server.send_P(200, "text/html", PAGE); }
+
+void handleJpg() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) { server.send(500, "text/plain", "capture failed"); return; }
+  uint8_t *jpg = nullptr;
+  size_t len = 0;
+  bool ok = frame2jpg(fb, 60, &jpg, &len);
+  esp_camera_fb_return(fb);
+  if (!ok) { server.send(500, "text/plain", "jpeg failed"); return; }
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "image/jpeg", (const char*)jpg, len);
+  free(jpg);
+}
+
+void handleStatus() {
+  char buf[160];
+  snprintf(buf, sizeof(buf),
+           "{\"state\":\"%s\",\"angle\":%d,\"dist\":%.1f,\"inRange\":%s}",
+           STATE_NAMES[state], angle, dist, inRange ? "true" : "false");
+  server.send(200, "application/json", buf);
+}
+
+void handleSet() {
+  if (server.hasArg("min")) minCm = constrain(server.arg("min").toInt(), 2, 400);
+  if (server.hasArg("max")) maxCm = constrain(server.arg("max").toInt(), 2, 400);
+  if (minCm > maxCm) { int t = minCm; minCm = maxCm; maxCm = t; }
+  server.send(200, "text/plain", "ok");
+}
+
+// ---------- Camera ----------
+bool startCamera() {
+  camera_config_t config = {};
+  config.ledc_channel = LEDC_CHANNEL_7;   // keep the camera clock away from the servo's PWM
+  config.ledc_timer   = LEDC_TIMER_3;
+  config.pin_d0 = 8;  config.pin_d1 = 9;  config.pin_d2 = 10; config.pin_d3 = 11;
+  config.pin_d4 = 12; config.pin_d5 = 13; config.pin_d6 = 14; config.pin_d7 = 15;
+  config.pin_xclk  = 16;
+  config.pin_pclk  = 17;
+  config.pin_vsync = 6;
+  config.pin_href  = 7;
+  config.pin_sccb_sda = 4;
+  config.pin_sccb_scl = 5;
+  config.pin_pwdn  = -1;
+  config.pin_reset = -1;
+  config.xclk_freq_hz = 5000000;          // use whatever clock gave you the cleanest image
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size   = FRAMESIZE_QQVGA;  // 160x120
+  config.fb_count     = 1;
+  config.fb_location  = CAMERA_FB_IN_DRAM;
+  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+  esp_err_t err = esp_camera_init(&config);
+  Serial.printf("Camera init: 0x%x (%s)\n", err, esp_err_to_name(err));
+  return err == ESP_OK;
+}
+
+// ---------- Distance ----------
+float readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long us = pulseIn(ECHO_PIN, HIGH, 20000);   // 20 ms timeout, about 3.4 m
+  if (us == 0) return -1;
+  return us * 0.0343f / 2.0f;
+}
+
+// ---------- Tracking ----------
+void stepScan() {
+  angle += dir * STEP;
+  if (angle >= hi) { angle = hi; dir = -1; }
+  if (angle <= lo) { angle = lo; dir = 1; }
+}
+
+void controlTick() {
+  dist = readDistanceCm();
+  inRange = (dist >= minCm && dist <= maxCm);
+
+  switch (state) {
+    case SEARCH:
+    case REACQUIRE:
+      if (inRange) {
+        state = CENTER;
+        startAngle = angle;
+        misses = 0;
+      } else {
+        if (state == REACQUIRE && millis() - reacqStart > REACQ_TIMEOUT_MS) {
+          state = SEARCH;
+          lo = ANGLE_MIN;
+          hi = ANGLE_MAX;
+        }
+        stepScan();
+      }
+      break;
+
+    case CENTER:
+      if (inRange) {
+        int next = angle + dir * STEP;
+        if (next > ANGLE_MAX || next < ANGLE_MIN) {
+          angle = (startAngle + angle) / 2;
+          state = LOCKED;
+        } else {
+          angle = next;
+        }
+      } else {
+        angle = (startAngle + angle) / 2;   // middle of the object
+        state = LOCKED;
+      }
+      break;
+
+    case LOCKED:
+      if (inRange) {
+        misses = 0;
+      } else if (++misses >= 3) {
+        state = REACQUIRE;
+        reacqStart = millis();
+        lo = max(ANGLE_MIN, angle - REACQ_SPAN);
+        hi = min(ANGLE_MAX, angle + REACQ_SPAN);
+        misses = 0;
+      }
+      break;
+  }
+  panServo.write(angle);
+}
+
+// ---------- Setup / loop ----------
+void setup() {
+  Serial.begin(115200);
+  delay(3000);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  if (!startCamera()) {
+    Serial.println("Camera failed. Check wiring.");
+    return;
+  }
+
+  ESP32PWM::allocateTimer(0);
+  panServo.setPeriodHertz(50);
+  panServo.attach(SERVO_PIN, 500, 2400);
+  panServo.write(angle);
+
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  if (strlen(password) == 0) WiFi.begin(ssid);
+  else WiFi.begin(ssid, password);
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 60) {
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nWiFi failed.");
+  } else {
+    Serial.println("\nWiFi connected.");
+    Serial.print("Open: http://");
+    Serial.println(WiFi.localIP());
+  }
+
+  server.on("/", handleRoot);
+  server.on("/jpg", handleJpg);
+  server.on("/status", handleStatus);
+  server.on("/set", handleSet);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  if (millis() - lastTick >= TICK_MS) {
+    lastTick = millis();
+    controlTick();
+  }
+}
